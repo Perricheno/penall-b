@@ -8,11 +8,11 @@
 
 ## M0 — Каркас (цель: `make dev` работает, CI зелёный)
 
-- [ ] **0.1** Скелет `api/`: FastAPI-приложение, `core/config.py` на pydantic-settings (ENV: `APP_ENV`, `DATABASE_URL`, `REDIS_URL`, `S3_ENDPOINT/KEY/SECRET/BUCKET`, `JWT_SECRET`, `OTP_SECRET`, `PAY_KASPI_TRADEPOINT_ID`, `PAY_KASPI_API_KEY`, `KASPI_BASE_URL`, `FCM_CREDENTIALS_JSON`, `SENTRY_DSN`), роут `GET /health` (проверяет pg+redis).
-- [ ] **0.2** `docker-compose.dev.yml`: postgres:16, redis:7, minio + init-бакет `media`; `Dockerfile` (slim, non-root); `Makefile` с командами из CLAUDE.md.
-- [ ] **0.3** Alembic в async-режиме, пустая базовая ревизия, `make migrate/upgrade`.
-- [ ] **0.4** Глобальный обработчик ошибок → формат `{"error":{...}}` (CLAUDE.md п.12); structlog JSON + request_id middleware.
-- [ ] **0.5** `.gitlab-ci.yml`: stages lint → test (services: pg, redis) → build (kaniko) → deploy-staging (пока заглушка `echo`, включим в M12).
+- [x] **0.1** Скелет `api/`: FastAPI-приложение, `core/config.py` на pydantic-settings (ENV: `APP_ENV`, `DATABASE_URL`, `REDIS_URL`, `S3_ENDPOINT/KEY/SECRET/BUCKET`, `JWT_SECRET`, `OTP_SECRET`, `PAY_KASPI_TRADEPOINT_ID`, `PAY_KASPI_API_KEY`, `KASPI_BASE_URL`, `FCM_CREDENTIALS_JSON`, `SENTRY_DSN`), роут `GET /health` (проверяет pg+redis).
+- [x] **0.2** `docker-compose.dev.yml`: postgres:16, redis:7, minio + init-бакет `media`; `Dockerfile` (slim, non-root); `Makefile` с командами из CLAUDE.md.
+- [x] **0.3** Alembic в async-режиме, пустая базовая ревизия, `make migrate/upgrade`.
+- [x] **0.4** Глобальный обработчик ошибок → формат `{"error":{...}}` (CLAUDE.md п.12); structlog JSON + request_id middleware.
+- [x] **0.5** `.gitlab-ci.yml`: stages lint → test (services: pg, redis) → build (kaniko) → deploy-staging (пока заглушка `echo`, включим в M12).
 
 ## M1 — Схема БД (контекст: `api_logic §1` + правки `feature_guides §17`)
 

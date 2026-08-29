@@ -1,0 +1,60 @@
+stages: [lint, test, build, deploy-staging]
+
+.python_base:
+  image: python:3.12-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends make > /dev/null
+    - pip install --no-cache-dir -e "./api[dev]"
+
+lint:
+  stage: lint
+  extends: .python_base
+  script:
+    - make lint
+
+test:
+  stage: test
+  extends: .python_base
+  services:
+    - name: postgres:16
+      alias: postgres
+    - name: redis:7
+      alias: redis
+  variables:
+    POSTGRES_USER: penall
+    POSTGRES_PASSWORD: penall_ci_password
+    POSTGRES_DB: penall
+    DATABASE_URL: postgresql+asyncpg://penall:penall_ci_password@postgres:5432/penall
+    REDIS_URL: redis://redis:6379/0
+    S3_ENDPOINT: http://minio:9000
+    S3_KEY: ci-fake-key
+    S3_SECRET: ci-fake-secret
+    S3_BUCKET: media
+    JWT_SECRET: ci-fake-jwt-secret
+    OTP_SECRET: ci-fake-otp-secret
+    PAY_KASPI_TRADEPOINT_ID: "000000"
+    PAY_KASPI_API_KEY: ci-fake-kaspi-key
+    KASPI_BASE_URL: https://example.test
+  script:
+    - make upgrade
+    - make test
+
+build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf '%s:%s' "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor --context "${CI_PROJECT_DIR}/api" --dockerfile "${CI_PROJECT_DIR}/api/Dockerfile" --destination "${CI_REGISTRY_IMAGE}/api:${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy-staging:
+  stage: deploy-staging
+  image: alpine:latest
+  script:
+    - echo "TODO M12: kubectl apply -k deploy/overlays/staging (image ${CI_COMMIT_SHORT_SHA})"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
