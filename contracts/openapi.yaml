@@ -1,0 +1,2062 @@
+openapi: 3.0.3
+info:
+  title: Shop API — интернет-магазин канцтоваров
+  version: 1.0.0
+  description: |
+    Единственный источник правды по контракту (ТЗ, раздел 3).
+    Правки — только через MR с апрувом обоих треков.
+
+    Договорённости:
+    - Деньги — целые тенге (int). Бонусы: 1 бонус = 1 ₸.
+    - Даты — ISO 8601 UTC.
+    - Телефоны — E.164: +7XXXXXXXXXX.
+    - Пагинация: ?page&limit → {items, meta:{page, limit, total}}.
+    - Ошибки: {"error":{"code":"...","message":"...","details":{}}}.
+      Реестр кодов — api_logic_v1.md, раздел 6.
+    - Публичные эндпоинты (каталог/поиск/конфиг) работают без токена.
+    - Цены/остатки/скидки считает только сервер.
+servers:
+  - url: http://localhost:4010/api/v1
+    description: Prism mock
+  - url: https://api-staging.SHOP.kz/api/v1
+    description: Staging
+  - url: https://api.SHOP.kz/api/v1
+    description: Production
+tags:
+  - name: auth
+  - name: config
+  - name: catalog
+  - name: cart
+  - name: orders
+  - name: payments
+  - name: profile
+  - name: bonuses
+  - name: favorites
+  - name: devices
+  - name: admin
+
+paths:
+  # ─────────────────────────── AUTH ───────────────────────────
+  /auth/otp/request:
+    post:
+      tags: [auth]
+      summary: Запросить SMS-код
+      operationId: otpRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, pattern: '^\+7\d{10}$', example: '+77071234567' }
+                channel: { type: string, enum: [whatsapp, sms], default: whatsapp, description: 'Куда слать код; сервер может сфолбэчить на sms' }
+      responses:
+        '200':
+          description: Код отправлен
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [retry_after, channel]
+                properties:
+                  retry_after: { type: integer, description: 'Секунд до повторной отправки', example: 60 }
+                  channel: { type: string, enum: [whatsapp, sms], description: 'Куда реально отправлен код (нет WhatsApp → sms)' }
+        '429':
+          $ref: '#/components/responses/Error429'
+        '422':
+          $ref: '#/components/responses/Error422'
+
+  /auth/otp/verify:
+    post:
+      tags: [auth]
+      summary: Проверить код, получить токены
+      operationId: otpVerify
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string, pattern: '^\+7\d{10}$' }
+                code: { type: string, minLength: 4, maxLength: 4 }
+      responses:
+        '200':
+          description: Успех. Если пользователь новый — создаётся.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens, user, is_new]
+                properties:
+                  tokens: { $ref: '#/components/schemas/Tokens' }
+                  user: { $ref: '#/components/schemas/User' }
+                  is_new: { type: boolean }
+        '400':
+          description: 'OTP_INVALID | OTP_EXPIRED | OTP_ATTEMPTS_EXCEEDED'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Обновить пару токенов (ротация refresh)
+      operationId: authRefresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        '200':
+          description: Новая пара
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tokens' }
+        '401':
+          $ref: '#/components/responses/Error401'
+
+  # ─────────────────────────── CONFIG ───────────────────────────
+  /config:
+    get:
+      tags: [config]
+      summary: Публичная конфигурация приложения
+      operationId: getConfig
+      responses:
+        '200':
+          description: Конфиг (кэшировать в приложении на сессию)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppConfig' }
+
+  # ─────────────────────────── CATALOG ───────────────────────────
+  /categories:
+    get:
+      tags: [catalog]
+      summary: Дерево категорий (2 уровня)
+      operationId: getCategories
+      responses:
+        '200':
+          description: Только активные, отсортированы по sort
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+              example:
+                items:
+                  - { id: 1, parent_id: null, name: 'Письменные принадлежности', slug: 'pismennye', image: 'https://cdn.shop.kz/cat/1.webp', sort: 1,
+                      children: [ { id: 11, parent_id: 1, name: 'Ручки шариковые', slug: 'ruchki-sharikovye', image: null, sort: 1, children: [] } ] }
+
+  /products:
+    get:
+      tags: [catalog]
+      summary: Листинг / поиск товаров
+      operationId: getProducts
+      parameters:
+        - { name: category_id, in: query, schema: { type: integer }, description: 'Подкатегория или корневая (включая детей)' }
+        - { name: search, in: query, schema: { type: string }, description: 'FTS + trgm по name/sku/description' }
+        - { name: sort, in: query, schema: { type: string, enum: [popular, price_asc, price_desc, new], default: popular } }
+        - { name: min_price, in: query, schema: { type: integer } }
+        - { name: max_price, in: query, schema: { type: integer } }
+        - { name: in_stock, in: query, schema: { type: boolean }, description: 'true — скрыть stock=0' }
+        - { name: attrs, in: query, schema: { type: string }, description: 'URL-encoded JSON-объект, напр. {"Бренд":"ErichKrause","Цвет":"Синий"}' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      security: [{}, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: 'stock=0 всегда в конце выдачи. is_favorite=false для гостя. bonus_amount — по уровню запросившего (гость = базовый).'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductCard' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+              example:
+                items:
+                  - { id: 17, name: 'Ручка шариковая ErichKrause R-301, синяя', sku: 'EK-R301-BL', price: 190, old_price: 250,
+                      image: 'https://cdn.shop.kz/p/17/card.webp', stock: 143, bonus_amount: 5, is_favorite: false }
+                meta: { page: 1, limit: 24, total: 312 }
+
+  /products/facets:
+    get:
+      tags: [catalog]
+      summary: Доступные фильтры для категории (для шторки фильтров)
+      operationId: getProductFacets
+      parameters:
+        - { name: category_id, in: query, required: true, schema: { type: integer } }
+        - { name: search, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Диапазон цен и значения атрибутов по активным товарам выборки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Facets' }
+              example:
+                price: { min: 90, max: 12500 }
+                attributes:
+                  - { key: 'Бренд', values: [ { value: 'ErichKrause', count: 42 }, { value: 'Berlingo', count: 17 } ] }
+                  - { key: 'Цвет', values: [ { value: 'Синий', count: 30 } ] }
+
+  /products/{id}:
+    get:
+      tags: [catalog]
+      summary: Карточка товара
+      operationId: getProduct
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: 'similar: та же подкатегория, in stock, цена ±40%, топ продаж, ≤10 шт.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductDetail' }
+        '404':
+          $ref: '#/components/responses/Error404'
+
+  /search/suggest:
+    get:
+      tags: [catalog]
+      summary: Подсказки поиска (от 2 символов, debounce на клиенте 300 мс)
+      operationId: searchSuggest
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2 } }
+      responses:
+        '200':
+          description: До 5 товаров + до 5 текстовых подсказок
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queries, products]
+                properties:
+                  queries:
+                    type: array
+                    items: { type: string }
+                  products:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductMini' }
+
+  /banners:
+    get:
+      tags: [catalog]
+      summary: Баннеры главной (активные, в периоде показа)
+      operationId: getBanners
+      responses:
+        '200':
+          description: Отсортированы по sort
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Banner' }
+
+  /collections/{key}:
+    get:
+      tags: [catalog]
+      summary: 'Подборки главной: hits | new | sale'
+      operationId: getCollection
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string, enum: [hits, new, sale] } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 'hits: топ sales_count; new: по created_at; sale: есть old_price. Только in stock.'
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductCard' }
+
+  # ─────────────────────────── CART ───────────────────────────
+  /cart/calculate:
+    post:
+      tags: [cart]
+      summary: Серверный пересчёт корзины (единственный источник итогов)
+      description: |
+        Вызывается при открытии корзины, любом изменении состава/промокода/бонусов
+        и на checkout (с delivery_type). Невалидный промокод НЕ роняет запрос:
+        promo.applied=false + promo.error_code, итоги считаются без него.
+        Гость: bonus.max_allowed=0, bonus_will_earn по базовому уровню.
+      operationId: cartCalculate
+      security: [{}, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CartCalculateRequest' }
+      responses:
+        '200':
+          description: Итоги
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartCalculateResponse' }
+              example:
+                items:
+                  - { product_id: 17, name: 'Ручка ErichKrause R-301', image: 'https://cdn.shop.kz/p/17/thumb.webp',
+                      price: 190, qty: 10, sum: 1900, stock: 143, available: true }
+                unavailable: [ { product_id: 45, reason: out_of_stock } ]
+                promo: { code: 'SCHOOL10', applied: true, discount: 190, error_code: null }
+                bonus: { requested: 500, applied: 500, max_allowed: 513, balance: 2100 }
+                totals: { items_total: 1900, promo_discount: 190, bonus_spent: 500,
+                          delivery_price: 1500, total: 2710, bonus_will_earn: 12 }
+                price_changed: false
+
+  # ─────────────────────────── ORDERS ───────────────────────────
+  /orders:
+    post:
+      tags: [orders]
+      summary: Создать заказ
+      description: |
+        Заголовок Idempotency-Key (UUID, генерирует клиент) обязателен: повтор с тем же
+        ключом возвращает уже созданный заказ (200), не создавая новый.
+        Сервер полностью пересчитывает корзину; если total ≠ client_total →
+        409 PRICE_CHANGED c актуальным calculate в details. Остатки резервируются
+        в транзакции создания. Неоплаченный online-заказ автоотменяется через 30 мин.
+      operationId: createOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreateRequest' }
+      responses:
+        '201':
+          description: Создан (200 — если вернули существующий по Idempotency-Key)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '409':
+          description: 'PRICE_CHANGED | OUT_OF_STOCK — в details свежий calculate'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          $ref: '#/components/responses/Error422'
+    get:
+      tags: [orders]
+      summary: Мои заказы
+      operationId: listOrders
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Новые сверху
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/OrderShort' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /orders/{id}:
+    get:
+      tags: [orders]
+      summary: Детали заказа
+      operationId: getOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Только свой заказ (иначе 404)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404':
+          $ref: '#/components/responses/Error404'
+
+  /orders/{id}/cancel:
+    post:
+      tags: [orders]
+      summary: Отменить заказ (только status=new)
+      operationId: cancelOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Отменён, остатки и бонусы возвращены
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '409':
+          description: ORDER_NOT_CANCELLABLE
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{id}/pay:
+    post:
+      tags: [orders]
+      summary: Получить ссылку на оплату
+      description: |
+        payment_url Каспи открывать внешним приложением (LaunchMode.externalApplication) —
+        ссылку перехватит установленный Kaspi.kz. Возврат ловим по AppLifecycleState.resumed
+        (returnUrl — серверная страница-заглушка, не deeplink), затем поллинг GET /orders/{id}
+        (2с, до 90с) до payment_status ∈ {paid, failed}. Истина — webhook/сверка с Kaspi.
+        Детали — kaspi_pay_integration.md.
+      operationId: payOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Ссылка действительна до payment_expires_at заказа
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payment_url]
+                properties:
+                  payment_url: { type: string, format: uri }
+        '409':
+          description: 'ALREADY_PAID | ORDER_NOT_PAYABLE'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ─────────────────────────── PAYMENTS ───────────────────────────
+  /payments/webhook/{provider}:
+    post:
+      tags: [payments]
+      summary: Webhook платёжного провайдера (S2S)
+      description: |
+        provider: kaspi. Тело — как присылает провайдер
+        (парсит адаптер PaymentProvider). Подпись проверяется ДО обработки, невалидная → 403.
+        Идемпотентность по external_id платежа: повтор → 200 без побочных эффектов.
+      operationId: paymentWebhook
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Принято
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '403':
+          description: Невалидная подпись
+
+  # ─────────────────────────── PROFILE / BONUSES / FAVORITES / DEVICES ─────────
+  /me:
+    get:
+      tags: [profile]
+      summary: Мой профиль
+      operationId: getMe
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+    put:
+      tags: [profile]
+      summary: Обновить профиль (телефон менять нельзя)
+      operationId: updateMe
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                email: { type: string, format: email, nullable: true }
+                birth_date: { type: string, format: date, nullable: true }
+      responses:
+        '200':
+          description: Обновлён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '422':
+          $ref: '#/components/responses/Error422'
+    delete:
+      tags: [profile]
+      summary: Удалить аккаунт (soft-delete + анонимизация ПДн)
+      operationId: deleteMe
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204':
+          description: Удалён, токены отозваны
+
+  /me/bonuses:
+    get:
+      tags: [bonuses]
+      summary: Бонусный счёт, уровень, прогресс
+      operationId: getBonuses
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Данные для экрана «Бонусы» и плашек
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BonusAccount' }
+              example:
+                balance: 2100
+                lifetime_spent: 87600
+                tier: { threshold: 50000, percent: 1 }
+                next_tier: { threshold: 100000, percent: 3, remaining: 12400 }
+                expiring_soon: { amount: 300, date: '2026-09-01' }
+
+  /me/bonuses/transactions:
+    get:
+      tags: [bonuses]
+      summary: История бонусных операций
+      operationId: getBonusTransactions
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Новые сверху
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/BonusTransaction' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /favorites:
+    get:
+      tags: [favorites]
+      summary: Избранное
+      operationId: getFavorites
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Карточки товаров
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductCard' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /favorites/{product_id}:
+    put:
+      tags: [favorites]
+      summary: Добавить в избранное (идемпотентно)
+      operationId: addFavorite
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: product_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '204':
+          description: Добавлено
+    delete:
+      tags: [favorites]
+      summary: Убрать из избранного (идемпотентно)
+      operationId: removeFavorite
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: product_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '204':
+          description: Убрано
+
+  /devices:
+    post:
+      tags: [devices]
+      summary: Зарегистрировать/обновить FCM-токен (upsert по токену)
+      operationId: registerDevice
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fcm_token, platform]
+              properties:
+                fcm_token: { type: string }
+                platform: { type: string, enum: [ios, android] }
+      responses:
+        '204':
+          description: Сохранён
+
+  # ═══════════════════════════ ADMIN ═══════════════════════════
+  /admin/auth/login:
+    post:
+      tags: [admin]
+      summary: Вход в админку (email + пароль)
+      operationId: adminLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: 'JWT с ролью admin | manager'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tokens' }
+        '401':
+          $ref: '#/components/responses/Error401'
+
+  /admin/dashboard:
+    get:
+      tags: [admin]
+      summary: Дашборд
+      operationId: adminDashboard
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Сводка
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+
+  /admin/products:
+    get:
+      tags: [admin]
+      summary: Товары (таблица)
+      operationId: adminListProducts
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: 'name | sku | barcode' }
+        - { name: category_id, in: query, schema: { type: integer } }
+        - { name: is_active, in: query, schema: { type: boolean } }
+        - { name: in_stock, in: query, schema: { type: boolean } }
+        - { name: sort, in: query, schema: { type: string, enum: [updated, name, price, stock, sales], default: updated } }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductAdmin' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+    post:
+      tags: [admin]
+      summary: Создать товар
+      operationId: adminCreateProduct
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductAdmin' }
+        '409':
+          description: SKU_EXISTS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          $ref: '#/components/responses/Error422'
+
+  /admin/products/{id}:
+    get:
+      tags: [admin]
+      summary: Товар
+      operationId: adminGetProduct
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200':
+          description: Товар
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductAdmin' }
+        '404':
+          $ref: '#/components/responses/Error404'
+    put:
+      tags: [admin]
+      summary: Обновить товар (полная замена)
+      operationId: adminUpdateProduct
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductInput' }
+      responses:
+        '200':
+          description: Обновлён (кэш каталога инвалидирован)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductAdmin' }
+    delete:
+      tags: [admin]
+      summary: Скрыть товар (is_active=false; физически не удаляем — есть в заказах)
+      operationId: adminDeleteProduct
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '204':
+          description: Скрыт
+
+  /admin/products/import:
+    post:
+      tags: [admin]
+      summary: XLSX-импорт (создать/обновить по SKU)
+      description: |
+        Шаблон колонок: sku*, name*, category_path* («Родитель / Подкатегория»),
+        price*, old_price, stock*, weight_g, barcode, description, attr:Ключ (любое число колонок).
+        dry_run=true — только проверка, ничего не пишем, возвращаем отчёт.
+        Ошибочные строки пропускаются, остальные применяются; отчёт всегда полный.
+      operationId: adminImportProducts
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: dry_run, in: query, schema: { type: boolean, default: true } }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Отчёт импорта
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportResult' }
+
+  /admin/products/export:
+    get:
+      tags: [admin]
+      summary: XLSX-экспорт каталога (тот же шаблон, что импорт)
+      operationId: adminExportProducts
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Файл
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+
+  /admin/products/bulk:
+    post:
+      tags: [admin]
+      summary: Массовые операции
+      operationId: adminBulkProducts
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, filter]
+              properties:
+                action: { type: string, enum: [price_percent, stock_set, activate, deactivate] }
+                filter:
+                  type: object
+                  properties:
+                    category_id: { type: integer, nullable: true }
+                    product_ids:
+                      type: array
+                      items: { type: integer }
+                      nullable: true
+                value: { type: number, nullable: true, description: 'price_percent: ±N (проценты); stock_set: значение' }
+      responses:
+        '200':
+          description: Готово
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [affected]
+                properties:
+                  affected: { type: integer }
+
+  /admin/uploads:
+    post:
+      tags: [admin]
+      summary: Загрузка изображения (сервер делает 3 размера WebP)
+      operationId: adminUpload
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Ссылки на размеры
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [thumb, card, full]
+                properties:
+                  thumb: { type: string, format: uri }
+                  card: { type: string, format: uri }
+                  full: { type: string, format: uri }
+
+  /admin/categories:
+    get:
+      tags: [admin]
+      summary: Дерево категорий (включая скрытые)
+      operationId: adminListCategories
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Дерево
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+    post:
+      tags: [admin]
+      summary: Создать категорию
+      operationId: adminCreateCategory
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryInput' }
+      responses:
+        '201':
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+
+  /admin/categories/{id}:
+    put:
+      tags: [admin]
+      summary: Обновить категорию
+      operationId: adminUpdateCategory
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryInput' }
+      responses:
+        '200':
+          description: Обновлена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+    delete:
+      tags: [admin]
+      summary: Удалить категорию (409, если есть товары или дети)
+      operationId: adminDeleteCategory
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '204':
+          description: Удалена
+        '409':
+          description: CATEGORY_NOT_EMPTY
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/categories/reorder:
+    post:
+      tags: [admin]
+      summary: Сохранить порядок/вложенность после drag-n-drop
+      operationId: adminReorderCategories
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, parent_id, sort]
+                    properties:
+                      id: { type: integer }
+                      parent_id: { type: integer, nullable: true }
+                      sort: { type: integer }
+      responses:
+        '204':
+          description: Сохранено
+
+  /admin/orders:
+    get:
+      tags: [admin]
+      summary: Заказы
+      operationId: adminListOrders
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/OrderStatus' } }
+        - { name: payment_status, in: query, schema: { $ref: '#/components/schemas/PaymentStatus' } }
+        - { name: search, in: query, schema: { type: string }, description: 'номер заказа | телефон' }
+        - { name: date_from, in: query, schema: { type: string, format: date } }
+        - { name: date_to, in: query, schema: { type: string, format: date } }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /admin/orders/{id}:
+    get:
+      tags: [admin]
+      summary: Заказ (с данными покупателя)
+      operationId: adminGetOrder
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200':
+          description: Заказ
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+
+  /admin/orders/{id}/status:
+    patch:
+      tags: [admin]
+      summary: Сменить статус (по таблице переходов, api_logic раздел 3)
+      operationId: adminPatchOrderStatus
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/OrderStatus' }
+                track_number: { type: string, nullable: true, description: 'Для kazpost при переходе в delivering' }
+      responses:
+        '200':
+          description: 'Сменён. done → начисление бонусов + push. Недопустимый переход → 409 INVALID_STATUS_TRANSITION'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '409':
+          description: INVALID_STATUS_TRANSITION
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/orders/{id}/cancel:
+    post:
+      tags: [admin]
+      summary: Отменить заказ (возврат остатков/бонусов; если paid — refund через провайдера)
+      operationId: adminCancelOrder
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: Отменён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+
+  /admin/orders/{id}/invoice:
+    get:
+      tags: [admin]
+      summary: Накладная XLSX по заказу (openpyxl-пайплайн З-2)
+      operationId: adminOrderInvoice
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200':
+          description: Файл
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema: { type: string, format: binary }
+
+  /admin/promo-codes:
+    get:
+      tags: [admin]
+      summary: Промокоды
+      operationId: adminListPromos
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PromoCode' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+    post:
+      tags: [admin]
+      summary: Создать промокод
+      operationId: adminCreatePromo
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoCodeInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromoCode' }
+
+  /admin/promo-codes/{id}:
+    put:
+      tags: [admin]
+      summary: Обновить промокод
+      operationId: adminUpdatePromo
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoCodeInput' }
+      responses:
+        '200':
+          description: Обновлён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromoCode' }
+    delete:
+      tags: [admin]
+      summary: Деактивировать промокод
+      operationId: adminDeletePromo
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '204':
+          description: Деактивирован
+
+  /admin/bonus-tiers:
+    get:
+      tags: [admin]
+      summary: Таблица уровней кэшбэка
+      operationId: adminGetTiers
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Уровни
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tiers]
+                properties:
+                  tiers:
+                    type: array
+                    items: { $ref: '#/components/schemas/BonusTier' }
+    put:
+      tags: [admin]
+      summary: Заменить таблицу уровней целиком (влияет только на новые заказы)
+      operationId: adminPutTiers
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tiers]
+              properties:
+                tiers:
+                  type: array
+                  items: { $ref: '#/components/schemas/BonusTier' }
+      responses:
+        '200':
+          description: Сохранено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tiers]
+                properties:
+                  tiers:
+                    type: array
+                    items: { $ref: '#/components/schemas/BonusTier' }
+
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: Пользователи
+      operationId: adminListUsers
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: search, in: query, schema: { type: string }, description: 'телефон | имя' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/UserAdmin' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+  /admin/users/{id}:
+    get:
+      tags: [admin]
+      summary: Карточка пользователя
+      operationId: adminGetUser
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '200':
+          description: Пользователь
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAdmin' }
+
+  /admin/users/{id}/bonus-adjust:
+    post:
+      tags: [admin]
+      summary: Ручная корректировка бонусов (только role=admin, комментарий обязателен)
+      operationId: adminBonusAdjust
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, comment]
+              properties:
+                amount: { type: integer, description: 'может быть отрицательным' }
+                comment: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Новый баланс
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [balance]
+                properties:
+                  balance: { type: integer }
+
+  /admin/users/{id}/block:
+    post:
+      tags: [admin]
+      summary: Заблокировать / разблокировать
+      operationId: adminBlockUser
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [blocked]
+              properties:
+                blocked: { type: boolean }
+      responses:
+        '204':
+          description: Готово
+
+  /admin/banners:
+    get:
+      tags: [admin]
+      summary: Баннеры (все)
+      operationId: adminListBanners
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Banner' }
+    post:
+      tags: [admin]
+      summary: Создать баннер
+      operationId: adminCreateBanner
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BannerInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Banner' }
+
+  /admin/banners/{id}:
+    put:
+      tags: [admin]
+      summary: Обновить баннер
+      operationId: adminUpdateBanner
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BannerInput' }
+      responses:
+        '200':
+          description: Обновлён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Banner' }
+    delete:
+      tags: [admin]
+      summary: Удалить баннер
+      operationId: adminDeleteBanner
+      security: [{ bearerAuth: [] }]
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses:
+        '204':
+          description: Удалён
+
+  /admin/settings:
+    get:
+      tags: [admin]
+      summary: Настройки магазина
+      operationId: adminGetSettings
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Настройки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+    put:
+      tags: [admin]
+      summary: Сохранить настройки (полная замена; только role=admin)
+      operationId: adminPutSettings
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Settings' }
+      responses:
+        '200':
+          description: Сохранено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+
+  /admin/imports:
+    get:
+      tags: [admin]
+      summary: Журнал импортов
+      operationId: adminListImports
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Журнал
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, meta]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ImportLog' }
+                  meta: { $ref: '#/components/schemas/Meta' }
+
+# ═══════════════════════════ COMPONENTS ═══════════════════════════
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 24 }
+
+  responses:
+    Error401:
+      description: 'TOKEN_INVALID | TOKEN_EXPIRED'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error404:
+      description: NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error422:
+      description: 'VALIDATION_ERROR — details.fields: {поле: сообщение}'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error429:
+      description: 'RATE_LIMITED — details.retry_after: секунды'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: 'OUT_OF_STOCK' }
+            message: { type: string, description: 'Человекочитаемо, RU, можно показывать пользователю' }
+            details: { type: object, additionalProperties: true, nullable: true }
+
+    Meta:
+      type: object
+      required: [page, limit, total]
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+
+    Tokens:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: 'Секунд жизни access', example: 1800 }
+
+    User:
+      type: object
+      required: [id, phone]
+      properties:
+        id: { type: integer }
+        phone: { type: string, example: '+77071234567' }
+        name: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        birth_date: { type: string, format: date, nullable: true }
+
+    Category:
+      type: object
+      required: [id, parent_id, name, slug, sort]
+      properties:
+        id: { type: integer }
+        parent_id: { type: integer, nullable: true }
+        name: { type: string }
+        slug: { type: string }
+        image: { type: string, format: uri, nullable: true }
+        sort: { type: integer }
+        is_active: { type: boolean, description: 'Только в админке' }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/Category' }
+
+    ProductMini:
+      type: object
+      required: [id, name, price]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        image: { type: string, format: uri, nullable: true, description: 'thumb 200px' }
+        price: { type: integer }
+
+    ProductCard:
+      type: object
+      required: [id, name, sku, price, stock, bonus_amount, is_favorite]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        sku: { type: string }
+        price: { type: integer }
+        old_price: { type: integer, nullable: true }
+        image: { type: string, format: uri, nullable: true, description: 'card 500px' }
+        stock: { type: integer, description: 'Клиент: 0 → «Нет в наличии», ≤10 → «Осталось X», иначе «В наличии»' }
+        bonus_amount: { type: integer, description: 'floor(price × tier%) запросившего; гость — базовый уровень' }
+        is_favorite: { type: boolean }
+
+    ProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/ProductCard'
+        - type: object
+          required: [images, attributes, description, category, similar]
+          properties:
+            description: { type: string }
+            images:
+              type: array
+              items: { type: string, format: uri }
+              description: 'full 1200px, по порядку'
+            attributes:
+              type: array
+              items: { $ref: '#/components/schemas/AttributeKV' }
+              description: 'Порядок = порядок отображения'
+            category:
+              type: object
+              required: [id, name]
+              properties:
+                id: { type: integer }
+                name: { type: string }
+            similar:
+              type: array
+              items: { $ref: '#/components/schemas/ProductCard' }
+
+    AttributeKV:
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, example: 'Бренд' }
+        value: { type: string, example: 'ErichKrause' }
+
+    Facets:
+      type: object
+      required: [price, attributes]
+      properties:
+        price:
+          type: object
+          required: [min, max]
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+        attributes:
+          type: array
+          items:
+            type: object
+            required: [key, values]
+            properties:
+              key: { type: string }
+              values:
+                type: array
+                items:
+                  type: object
+                  required: [value, count]
+                  properties:
+                    value: { type: string }
+                    count: { type: integer }
+
+    Banner:
+      type: object
+      required: [id, image, link_type, link_value]
+      properties:
+        id: { type: integer }
+        image: { type: string, format: uri }
+        link_type: { type: string, enum: [category, product, url, none] }
+        link_value: { type: string, nullable: true, description: 'id категории/товара или URL' }
+        sort: { type: integer }
+        is_active: { type: boolean }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+
+    BannerInput:
+      type: object
+      required: [image, link_type]
+      properties:
+        image: { type: string, format: uri, description: 'из /admin/uploads' }
+        link_type: { type: string, enum: [category, product, url, none] }
+        link_value: { type: string, nullable: true }
+        sort: { type: integer, default: 0 }
+        is_active: { type: boolean, default: true }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+
+    AppConfig:
+      type: object
+      required: [store, delivery, bonus, payment, legal]
+      properties:
+        store:
+          type: object
+          properties:
+            name: { type: string }
+            phone: { type: string }
+            whatsapp_phone: { type: string, description: 'для wa.me' }
+            pickup_address: { type: string }
+            work_hours: { type: string, example: 'Пн–Сб 9:00–19:00' }
+        delivery:
+          type: object
+          properties:
+            methods:
+              type: array
+              description: 'Что показывать в чекауте; порядок = порядок в списке'
+              items:
+                type: object
+                properties:
+                  code: { type: string, enum: [pickup, courier, kazpost] }
+                  title: { type: string, example: 'Курьером по Астане' }
+                  enabled: { type: boolean }
+            courier_price: { type: integer, example: 1500 }
+            courier_free_from: { type: integer, example: 20000, description: 'Сравнивается с items_total − promo_discount' }
+            kazpost_note: { type: string, example: 'Казпочтой по РК, 3–7 дней, тариф по весу' }
+        bonus:
+          type: object
+          properties:
+            redeem_limit_percent: { type: integer, example: 30 }
+            tiers:
+              type: array
+              items: { $ref: '#/components/schemas/BonusTier' }
+        payment:
+          type: object
+          properties:
+            methods:
+              type: array
+              description: 'Что показывать в чекауте; порядок = порядок в списке'
+              items:
+                type: object
+                properties:
+                  code: { type: string, enum: [kaspi] }
+                  title: { type: string, example: 'Kaspi Pay' }
+                  enabled: { type: boolean }
+        legal:
+          type: object
+          properties:
+            offer_url: { type: string, format: uri }
+            privacy_url: { type: string, format: uri }
+        min_app_version:
+          type: object
+          properties:
+            ios: { type: string, example: '1.0.0' }
+            android: { type: string, example: '1.0.0' }
+
+    CartCalculateRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [product_id, qty]
+            properties:
+              product_id: { type: integer }
+              qty: { type: integer, minimum: 1, maximum: 999 }
+              price: { type: integer, nullable: true, description: 'Последняя цена, которую видел клиент — для флага price_changed' }
+        promo_code: { type: string, nullable: true }
+        bonus_to_spend: { type: integer, nullable: true, minimum: 0 }
+        delivery_type: { type: string, enum: [pickup, courier, kazpost], default: pickup }
+        destination:
+          type: object
+          nullable: true
+          description: 'Обязателен для kazpost — иначе totals.delivery_price = null'
+          properties:
+            city: { type: string }
+            index: { type: string, description: 'Почтовый индекс' }
+
+    CalculatedItem:
+      type: object
+      required: [product_id, name, price, qty, sum, stock, available]
+      properties:
+        product_id: { type: integer }
+        name: { type: string }
+        image: { type: string, format: uri, nullable: true }
+        price: { type: integer, description: 'Актуальная серверная цена' }
+        qty: { type: integer, description: 'Может быть урезан до stock' }
+        sum: { type: integer }
+        stock: { type: integer }
+        available: { type: boolean }
+
+    CartCalculateResponse:
+      type: object
+      required: [items, unavailable, promo, bonus, totals, price_changed]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CalculatedItem' }
+        unavailable:
+          type: array
+          items:
+            type: object
+            required: [product_id, reason]
+            properties:
+              product_id: { type: integer }
+              reason: { type: string, enum: [out_of_stock, inactive, not_found] }
+        promo:
+          type: object
+          nullable: true
+          required: [code, applied, discount]
+          properties:
+            code: { type: string }
+            applied: { type: boolean }
+            discount: { type: integer }
+            error_code: { type: string, nullable: true, description: 'PROMO_NOT_FOUND | PROMO_EXPIRED | PROMO_MIN_ORDER | PROMO_LIMIT_REACHED | PROMO_USER_LIMIT' }
+        bonus:
+          type: object
+          required: [requested, applied, max_allowed, balance]
+          properties:
+            requested: { type: integer }
+            applied: { type: integer, description: 'min(requested, max_allowed, balance)' }
+            max_allowed: { type: integer, description: 'floor(redeem_limit% × (items_total − promo_discount))' }
+            balance: { type: integer }
+        totals:
+          type: object
+          required: [items_total, promo_discount, bonus_spent, delivery_price, total, bonus_will_earn]
+          properties:
+            items_total: { type: integer }
+            promo_discount: { type: integer }
+            bonus_spent: { type: integer }
+            delivery_price: { type: integer, nullable: true, description: 'null — kazpost без destination; пока null, заказ оформить нельзя' }
+            total: { type: integer, nullable: true }
+            bonus_will_earn: { type: integer, description: 'floor(tier% × (items_total − promo_discount − bonus_spent))' }
+        price_changed: { type: boolean, description: 'true, если серверная цена ≠ price из запроса хотя бы по одной позиции' }
+
+    OrderStatus:
+      type: string
+      enum: [new, confirmed, assembling, ready_for_pickup, delivering, done, cancelled]
+
+    PaymentStatus:
+      type: string
+      enum: [pending, paid, failed, refunded]
+
+    OrderCreateRequest:
+      type: object
+      required: [items, delivery_type, recipient, payment_method, client_total]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [product_id, qty]
+            properties:
+              product_id: { type: integer }
+              qty: { type: integer, minimum: 1 }
+        delivery_type: { type: string, enum: [pickup, courier, kazpost] }
+        address:
+          type: object
+          nullable: true
+          description: 'courier: street, house. kazpost: city, index, street, house'
+          properties:
+            city: { type: string, nullable: true }
+            index: { type: string, nullable: true }
+            street: { type: string }
+            house: { type: string }
+            apartment: { type: string, nullable: true }
+            comment: { type: string, nullable: true }
+        recipient:
+          type: object
+          required: [name, phone]
+          properties:
+            name: { type: string }
+            phone: { type: string, pattern: '^\+7\d{10}$' }
+        payment_method: { type: string, enum: [kaspi], description: 'MVP: только Kaspi Pay; список методов — из /config' }
+        promo_code: { type: string, nullable: true }
+        bonus_to_spend: { type: integer, nullable: true, minimum: 0 }
+        client_total: { type: integer, description: 'Итог, который видел пользователь; при расхождении → 409 PRICE_CHANGED' }
+
+    OrderItem:
+      type: object
+      required: [product_id, name, price, qty, sum]
+      properties:
+        product_id: { type: integer }
+        name: { type: string, description: 'Снапшот на момент заказа' }
+        image: { type: string, format: uri, nullable: true }
+        price: { type: integer, description: 'Снапшот' }
+        qty: { type: integer }
+        sum: { type: integer }
+
+    OrderTotals:
+      type: object
+      required: [items_total, promo_discount, bonus_spent, delivery_price, total]
+      properties:
+        items_total: { type: integer }
+        promo_discount: { type: integer }
+        bonus_spent: { type: integer }
+        delivery_price: { type: integer }
+        total: { type: integer }
+
+    Order:
+      type: object
+      required: [id, number, status, payment_method, payment_status, delivery_type, recipient, items, totals, bonus_earned, can_cancel, created_at]
+      properties:
+        id: { type: integer }
+        number: { type: string, example: 'ORD-2026-000123' }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        payment_method: { type: string, enum: [kaspi] }
+        payment_status: { $ref: '#/components/schemas/PaymentStatus' }
+        payment_expires_at: { type: string, format: date-time, nullable: true, description: 'Дедлайн оплаты online-заказа' }
+        delivery_type: { type: string, enum: [pickup, courier, kazpost] }
+        address:
+          type: object
+          nullable: true
+          additionalProperties: true
+        recipient:
+          type: object
+          required: [name, phone]
+          properties:
+            name: { type: string }
+            phone: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        totals: { $ref: '#/components/schemas/OrderTotals' }
+        bonus_earned: { type: integer, description: 'Зафиксирован при создании, зачисляется при done' }
+        promo_code: { type: string, nullable: true }
+        receipt_url: { type: string, format: uri, nullable: true, description: 'Чек ОФД, появляется после paid' }
+        track_number: { type: string, nullable: true, description: 'Трек Казпочты, появляется при delivering' }
+        can_cancel: { type: boolean, description: 'status=new' }
+        user: { $ref: '#/components/schemas/User', description: 'Только в /admin/*' }
+        created_at: { type: string, format: date-time }
+
+    OrderShort:
+      type: object
+      required: [id, number, status, payment_status, total, items_count, created_at]
+      properties:
+        id: { type: integer }
+        number: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        payment_status: { $ref: '#/components/schemas/PaymentStatus' }
+        total: { type: integer }
+        items_count: { type: integer }
+        item_images:
+          type: array
+          items: { type: string, format: uri }
+          maxItems: 3
+        created_at: { type: string, format: date-time }
+
+    BonusTier:
+      type: object
+      required: [threshold, percent]
+      properties:
+        threshold: { type: integer, description: 'Накоплено покупок от, ₸', example: 50000 }
+        percent: { type: number, example: 1 }
+
+    BonusAccount:
+      type: object
+      required: [balance, lifetime_spent, tier]
+      properties:
+        balance: { type: integer }
+        lifetime_spent: { type: integer, description: 'Сумма товарной части выполненных заказов, оплаченная деньгами' }
+        tier: { $ref: '#/components/schemas/BonusTier' }
+        next_tier:
+          allOf:
+            - $ref: '#/components/schemas/BonusTier'
+            - type: object
+              properties:
+                remaining: { type: integer, description: 'Сколько осталось до порога' }
+          nullable: true
+        expiring_soon:
+          type: object
+          nullable: true
+          properties:
+            amount: { type: integer }
+            date: { type: string, format: date }
+
+    BonusTransaction:
+      type: object
+      required: [id, type, amount, created_at]
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [accrual, redeem, expire, adjust, revert] }
+        amount: { type: integer, description: 'accrual/adjust+ положительный; redeem/expire/adjust− отрицательный' }
+        order_number: { type: string, nullable: true }
+        comment: { type: string, nullable: true }
+        expires_at: { type: string, format: date, nullable: true, description: 'Для accrual' }
+        created_at: { type: string, format: date-time }
+
+    PromoCodeInput:
+      type: object
+      required: [code, type, value]
+      properties:
+        code: { type: string, minLength: 3, maxLength: 32 }
+        type: { type: string, enum: [percent, fixed] }
+        value: { type: integer, description: 'percent: 1–100; fixed: ₸' }
+        min_order: { type: integer, default: 0 }
+        valid_from: { type: string, format: date-time, nullable: true }
+        valid_to: { type: string, format: date-time, nullable: true }
+        usage_limit: { type: integer, nullable: true }
+        per_user_limit: { type: integer, nullable: true, default: 1 }
+        stacks_with_bonus: { type: boolean, default: true }
+        is_active: { type: boolean, default: true }
+
+    PromoCode:
+      allOf:
+        - $ref: '#/components/schemas/PromoCodeInput'
+        - type: object
+          required: [id, used_count]
+          properties:
+            id: { type: integer }
+            used_count: { type: integer }
+
+    ProductInput:
+      type: object
+      required: [category_id, sku, name, price, stock]
+      properties:
+        category_id: { type: integer, description: 'Только подкатегория (2-й уровень)' }
+        sku: { type: string }
+        barcode: { type: string, nullable: true }
+        name: { type: string, maxLength: 300 }
+        description: { type: string, nullable: true }
+        price: { type: integer, minimum: 1 }
+        old_price: { type: integer, nullable: true, description: 'Должна быть > price' }
+        stock: { type: integer, minimum: 0 }
+        weight_g: { type: integer, nullable: true, description: 'Вес, г — для тарифа Казпочты; null → default_weight_g из настроек' }
+        attributes:
+          type: array
+          items: { $ref: '#/components/schemas/AttributeKV' }
+        images:
+          type: array
+          items: { type: string, format: uri }
+          maxItems: 10
+          description: 'URL из /admin/uploads, порядок = порядок показа'
+        is_active: { type: boolean, default: true }
+
+    ProductAdmin:
+      allOf:
+        - $ref: '#/components/schemas/ProductInput'
+        - type: object
+          required: [id, sales_count, created_at, updated_at]
+          properties:
+            id: { type: integer }
+            sales_count: { type: integer }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    CategoryInput:
+      type: object
+      required: [name]
+      properties:
+        parent_id: { type: integer, nullable: true }
+        name: { type: string }
+        image: { type: string, format: uri, nullable: true }
+        sort: { type: integer, default: 0 }
+        is_active: { type: boolean, default: true }
+
+    ImportResult:
+      type: object
+      required: [dry_run, total_rows, created, updated, errors]
+      properties:
+        dry_run: { type: boolean }
+        total_rows: { type: integer }
+        created: { type: integer }
+        updated: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [row, error]
+            properties:
+              row: { type: integer }
+              sku: { type: string, nullable: true }
+              error: { type: string, example: 'Категория «Канцелярия / Степлеры» не найдена' }
+        import_id: { type: integer, nullable: true, description: 'null при dry_run' }
+
+    ImportLog:
+      type: object
+      required: [id, filename, created_rows, updated_rows, errors_count, created_at]
+      properties:
+        id: { type: integer }
+        filename: { type: string }
+        created_rows: { type: integer }
+        updated_rows: { type: integer }
+        errors_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    UserAdmin:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            is_blocked: { type: boolean }
+            orders_count: { type: integer }
+            orders_total: { type: integer }
+            bonus_balance: { type: integer }
+            lifetime_spent: { type: integer }
+            created_at: { type: string, format: date-time }
+
+    Dashboard:
+      type: object
+      required: [today, week, orders_by_status, top_products]
+      properties:
+        today:
+          type: object
+          properties:
+            orders: { type: integer }
+            revenue: { type: integer }
+        week:
+          type: object
+          properties:
+            orders: { type: integer }
+            revenue: { type: integer }
+            avg_check: { type: integer }
+        orders_by_status:
+          type: object
+          additionalProperties: { type: integer }
+        top_products:
+          type: array
+          items:
+            type: object
+            properties:
+              product_id: { type: integer }
+              name: { type: string }
+              qty: { type: integer }
+              revenue: { type: integer }
+
+    Settings:
+      type: object
+      required: [store, delivery, bonus, payment, legal]
+      properties:
+        store:
+          type: object
+          properties:
+            name: { type: string }
+            phone: { type: string }
+            whatsapp_phone: { type: string }
+            pickup_address: { type: string }
+            work_hours: { type: string }
+        delivery:
+          type: object
+          properties:
+            methods_enabled:
+              type: object
+              additionalProperties: { type: boolean }
+              description: '{pickup, courier, kazpost}'
+            courier_price: { type: integer }
+            courier_free_from: { type: integer }
+            default_weight_g: { type: integer, example: 200 }
+        bonus:
+          type: object
+          properties:
+            redeem_limit_percent: { type: integer }
+            expiry_days: { type: integer, example: 180 }
+        payment:
+          type: object
+          properties:
+            methods_enabled:
+              type: object
+              additionalProperties: { type: boolean }
+              description: '{kaspi}; ключи/секреты провайдера — в k8s Secrets, не здесь'
+        legal:
+          type: object
+          properties:
+            offer_url: { type: string }
+            privacy_url: { type: string }
+        min_app_version:
+          type: object
+          properties:
+            ios: { type: string }
+            android: { type: string }
